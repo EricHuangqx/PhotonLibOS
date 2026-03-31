@@ -302,7 +302,8 @@ namespace photon
     class mutex : protected waitq
     {
     public:
-        mutex(uint16_t max_retries = 100) : retries(max_retries) { }
+        mutex(uint16_t max_retries = 100, bool contending = false)
+            : retries(max_retries), _contending(contending) { }
         int lock(Timeout timeout = {});
         int try_lock();
         void unlock();
@@ -315,6 +316,7 @@ namespace photon
         std::atomic<thread*> owner{nullptr};
         uint16_t retries;
         spinlock splock;
+        bool _contending;
     };
 
     class seq_mutex : protected mutex {
@@ -585,6 +587,118 @@ namespace photon
     protected:
         rwlock* m_rwlock;
         bool m_locked;
+    };
+
+    // High-performance rwlock without starvation prevention.
+    // Optimized for read-heavy workloads using lock-free atomic operations
+    // for the read lock fast path.
+    class qrwlock {
+    protected:
+        constexpr static int64_t MAX_SHARED_LOCK_COUNT = 1 << 16;
+        constexpr static int64_t WRITE_LOCKED = -1;
+
+        // State encoding:
+        //   state > 0  : number of active readers
+        //   state == 0 : unlocked
+        //   state == -1: write-locked
+
+        std::atomic<int64_t> lock_state{0};
+        photon::condition_variable cv_shared;
+        photon::condition_variable cv_unique;
+        photon::spinlock spin;
+
+        // Must be called with spinlock held.
+        void try_wake() {
+            if (!cv_unique.notify_one()) {
+                cv_shared.notify_all();
+            }
+        }
+
+        // Common blocking lock pattern: fast-path try, then slow-path wait
+        // loop. try_fn must be safe to call both with and without spinlock
+        // held.
+        template <typename TryFunc>
+        int do_lock(TryFunc&& try_fn, photon::condition_variable& cv,
+                    Timeout timeout) {
+            if (try_fn()) return 0;
+            SCOPED_LOCK(spin);
+            while (true) {
+                if (try_fn()) return 0;
+                int ret = cv.wait(spin, timeout);
+                if (ret < 0) {
+                    return -1;
+                }
+            }
+        }
+
+        void __unlock_unique() {
+            SCOPED_LOCK(spin);
+            assert(lock_state.load(std::memory_order_relaxed) == WRITE_LOCKED);
+            lock_state.store(0, std::memory_order_release);
+            try_wake();
+        }
+
+        void __unlock_shared() {
+            auto prev = lock_state.fetch_sub(1, std::memory_order_acq_rel);
+            assert(prev > 0);  // prev<=0 indicates misuse
+            if (prev == 1) {
+                SCOPED_LOCK(spin);
+                try_wake();
+            }
+        }
+
+        bool __trylock() {
+            int64_t expected = 0;
+            return lock_state.compare_exchange_strong(
+                expected, WRITE_LOCKED, std::memory_order_acq_rel,
+                std::memory_order_relaxed);
+        }
+
+        bool __trylock_shared() {
+            auto state = lock_state.load(std::memory_order_acquire);
+            while (state >= 0 && state < MAX_SHARED_LOCK_COUNT) {
+                if (lock_state.compare_exchange_weak(state, state + 1,
+                                                     std::memory_order_acq_rel,
+                                                     std::memory_order_acquire))
+                    return true;
+            }
+            return false;
+        }
+
+    public:
+        qrwlock() = default;
+        qrwlock(const qrwlock&) = delete;
+        qrwlock& operator=(const qrwlock&) = delete;
+
+        int try_lock(int mode) {
+            if (mode == WLOCK)
+                return __trylock() ? 0 : -1;
+            else
+                return __trylock_shared() ? 0 : -1;
+        }
+
+        int lock(int mode, Timeout timeout = {}) {
+            if (mode == WLOCK)
+                return do_lock([this] { return __trylock(); }, cv_unique,
+                               timeout);
+            else
+                return do_lock([this] { return __trylock_shared(); }, cv_shared,
+                               timeout);
+        }
+
+        int unlock() {
+            auto cur_state = lock_state.load(std::memory_order_acquire);
+            if (cur_state == 0) {
+                errno = ENOLCK;
+                return -1;
+            }
+            if (cur_state == WRITE_LOCKED) {
+                __unlock_unique();
+            } else {
+                __unlock_shared();
+            }
+            return 0;
+        }
     };
 
     // create `n` threads to run `start(arg)`, then get joined

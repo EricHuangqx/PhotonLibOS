@@ -74,10 +74,14 @@ static SimpleDOM::Node get_xml_node(HTTP_STACK_OP& op) {
 }
 
 // convert oss last modified time, e.g. "Fri, 04 Mar 2022 02:46:25 GMT"
-static time_t get_lastmodified(const char* s) {
-  struct tm tm;
-  memset(&tm, 0, sizeof(struct tm));
-  strptime(s, "%a, %d %b %Y %H:%M:%S %Z", &tm);
+static time_t get_lastmodified(std::string_view sv) {
+  if (sv.size() != 29) {
+    LOG_ERROR_RETURN(0, 0, "invalid lastmodified time: ", sv);
+  }
+  struct tm tm{};
+  if (!strptime(sv.data(), "%a, %d %b %Y %H:%M:%S GMT", &tm)) {
+    LOG_ERROR_RETURN(0, 0, "invalid lastmodified time: ", sv);
+  }
   return timegm(&tm);  // GMT
 }
 
@@ -87,9 +91,8 @@ static time_t get_list_lastmodified(std::string_view sv) {
   if (sv.size() != 24) {
     LOG_ERROR_RETURN(0, 0, "invalid lastmodified time: ", sv);
   }
-  struct tm tm;
-  memset(&tm, 0, sizeof(struct tm));
-  if (!strptime(sv.data(), "%Y-%m-%dT%H:%M:%S.000%Z", &tm)) {
+  struct tm tm{};
+  if (!strptime(sv.data(), "%Y-%m-%dT%H:%M:%S.000Z", &tm)) {
     LOG_ERROR_RETURN(0, 0, "invalid lastmodified time: ", sv);
   }
   return timegm(&tm);  // GMT
@@ -274,8 +277,10 @@ __retry:
       }
     }
     if (op.status_code == -1) {
-        LOG_ERROR("operation on [`] failed!, http connection error", object);
+        LOG_ERROR("operation on [`] failed!, http connection error `", 
+                  object, ERRNO(__saved_errno));
         errno = __saved_errno;
+        if (errno != ETIMEDOUT) errno = EIO;
         return ret;
     }
     if (op.status_code / 100 == 4) {
@@ -395,7 +400,7 @@ class OssClientImpl : public Client {
   int walk_list_results(const SimpleDOM::Node& node, ListObjectsCallback cb);
   int do_list_objects_v2(std::string_view bucket, std::string_view prefix,
                          ListObjectsCallback cb, bool delimiters, int maxKeys,
-                         std::string* marker);
+                         std::string* marker, std::string_view start_after);
   int do_list_objects_v1(std::string_view bucket, std::string_view prefix,
                          ListObjectsCallback cb, bool delimiters, int maxKeys,
                          std::string* marker);
@@ -524,10 +529,9 @@ int OssClient::walk_list_results(const SimpleDOM::Node& list_bucket_result,
   return 0;
 }
 
-int OssClient::do_list_objects_v2(std::string_view bucket,
-                                  std::string_view prefix,
-                                  ListObjectsCallback cb, bool delimiters,
-                                  int maxKeys, std::string* marker) {
+int OssClient::do_list_objects_v2(std::string_view bucket, std::string_view prefix,
+                                  ListObjectsCallback cb, bool delimiters, int maxKeys,
+                                  std::string* marker, std::string_view start_after) {
   if (maxKeys > 1000 || maxKeys <= 0) maxKeys = m_oss_options.max_list_ret_cnt;
   estring_view _mark;
   if (marker) _mark = *marker;
@@ -535,6 +539,7 @@ int OssClient::do_list_objects_v2(std::string_view bucket,
   estring escaped_prefix = photon::net::http::url_escape(prefix);
   estring escaped_delimiter = photon::net::http::url_escape("/");
   estring escaped_marker = photon::net::http::url_escape(_mark);
+  estring escaped_start_after = photon::net::http::url_escape(start_after);
   estring max_key_str = std::to_string(maxKeys);
   // must appear in dictionary order!
   DEFINE_APPENDABLE_ORDERED_STRING_KV(
@@ -549,7 +554,8 @@ int OssClient::do_list_objects_v2(std::string_view bucket,
     query_params.insert({OSS_PARAM_KEY_DELIMITER, escaped_delimiter});
   if (!_mark.empty())
     query_params.insert({OSS_PARAM_KEY_CONTINUATION_TOKEN, escaped_marker});
-
+  if (!start_after.empty())
+    query_params.insert({OSS_PARAM_KEY_START_AFTER, escaped_start_after});
   OssUrl oss_url(m_endpoint, bucket, {}, m_is_http);
   DEFINE_ONSTACK_OP(m_client, Verb::GET, oss_url.append_params(query_params));
   int r = sign_and_call(op, Verb::GET, oss_url, query_params);
@@ -787,7 +793,7 @@ int OssClient::list_objects(std::string_view prefix, ListObjectsCallback cb,
   do {
     if (params.ver == 2) {
       r = do_list_objects_v2(m_bucket, prefix, cb, params.slash_delimiter,
-                             max_keys, &marker);
+                             max_keys, &marker, params.start_after);
     } else {
       r = do_list_objects_v1(m_bucket, prefix, cb, params.slash_delimiter,
                              max_keys, &marker);
@@ -833,7 +839,7 @@ int OssClient::fill_meta(HTTP_STACK_OP& op, ObjectMeta& meta) {
     if (it.second().empty())
       meta.set_mtime(0);
     else
-      meta.set_mtime(get_lastmodified(it.second().data()));
+      meta.set_mtime(get_lastmodified(it.second()));
   }
 
   it = op.resp.headers.find("ETag");
@@ -1149,7 +1155,7 @@ int OssClient::batch_get_objects(std::vector<GetObjectParameters>& params) {
         param.meta->set_etag(meta_map["ETag"]);
         param.meta->set_storage_class(meta_map["x-oss-storage-class"]);
         param.meta->set_mtime(
-            get_lastmodified(meta_map["Last-Modified"].c_str()));
+            get_lastmodified(meta_map["Last-Modified"]));
         param.meta->set_crc64(
             estring_view(meta_map["x-oss-hash-crc64ecma"]).to_uint64());
         param.meta->set_size(
@@ -1187,7 +1193,7 @@ int OssClient::batch_get_objects(std::vector<GetObjectParameters>& params) {
           remaining -= cur;
           if (remaining == 0) break;
         }
-        
+
         r = frame.read_data(stream, &iovs[0], iovs.size());
       } else {
         r = frame.read_data(stream, param.iov, param.iovcnt);
@@ -1653,11 +1659,13 @@ class BasicAuthenticator : public Authenticator {
   void update_gmt_date() {  // avoid updating GMT Time every time
     time_t t = photon::now / 1000 / 1000;
     if (t - m_last_tim > GMT_UPDATE_INTERVAL || m_last_tim == 0) {
-      m_last_tim = t;
-      std::time_t tm = std::time(nullptr);
-      struct tm* p = gmtime(&tm);
-      strftime(m_gmt_date, GMT_DATE_LIMIT, "%a, %d %b %Y %H:%M:%S %Z", p);
-      strftime(m_gmt_date_iso8601, GMT_DATE_LIMIT, "%Y%m%dT%H%M%SZ", p);
+      std::time_t now = std::time(nullptr);
+      struct tm tm{};
+      if (gmtime_r(&now, &tm)) {
+        m_last_tim = t;
+        strftime(m_gmt_date, GMT_DATE_LIMIT, "%a, %d %b %Y %H:%M:%S GMT", &tm);
+        strftime(m_gmt_date_iso8601, GMT_DATE_LIMIT, "%Y%m%dT%H%M%SZ", &tm);
+      }
     }
   }
 

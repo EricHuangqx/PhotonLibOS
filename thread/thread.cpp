@@ -389,6 +389,10 @@ namespace photon
         thread* pop_front()
         {
             auto ret = q[0];
+            if (q.size() == 1) {
+                q.pop_back();
+                return ret;
+            }
             q[0] = q.back();
             q[0]->idx = 0;
             q.pop_back();
@@ -407,6 +411,11 @@ namespace photon
             }
 
             auto id = obj->idx;
+            if (q.size() == 1) {
+                assert(id == 0);
+                q.pop_back();
+                return 0;
+            }
             q[obj->idx] = q.back();
             q[id]->idx = id;
             q.pop_back();
@@ -424,6 +433,7 @@ namespace photon
         // compare m_nodes[idx] with parent node.
         bool up(int idx)
         {
+            assert(!q.empty());
             auto tmp = q[idx];
             bool ret = false;
             while (idx != 0){
@@ -443,6 +453,7 @@ namespace photon
         // compare m_nodes[idx] with child node.
         bool down(int idx)
         {
+            assert(!q.empty());
             auto tmp = q[idx];
             size_t cmpIdx = (idx << 1) + 1;
             bool ret = false;
@@ -1725,7 +1736,7 @@ insert_list:
         {
             assert(h->waitq == (thread_list*)this);
             prelocked_thread_interrupt(h, error_number);
-            assert(h->waitq == nullptr);
+            // assert(h->waitq == nullptr);
             assert(this->q.th != h);
         }
         return h;
@@ -1750,6 +1761,7 @@ insert_list:
             if (unlikely(ret)) { errno = ret; return -1; }
             if (try_lock() == 0) return 0;
         }
+    again:
         splock.lock();
         if (try_lock() == 0) {
             splock.unlock();
@@ -1764,6 +1776,10 @@ insert_list:
 
         int ret = thread_usleep_defer(timeout,
             (thread_list*)&q, &spinlock_unlock, &splock);
+        if (likely(ret < 0 && errno == -1)) {
+            auto o = owner.load(std::memory_order_acquire);
+            if (unlikely(o != CURRENT)) { assert(_contending); goto again; }
+        }
         return waitq_translate_errno(ret);
     }
     int mutex::try_lock()
@@ -1777,7 +1793,7 @@ insert_list:
     {
         SCOPED_LOCK(m->splock);
         ScopedLockHead h(m);
-        m->owner.store(h);
+        m->owner.store(unlikely(m->_contending) ? nullptr : (thread*)h);
         if (h)
             prelocked_thread_interrupt(h, -1);
     }
@@ -2231,42 +2247,42 @@ insert_list:
         photon_thread_dealloc = _photon_thread_dealloc;
     }
 
-    extern "C" {
-    [[gnu::used]]
-    void *gdb_get_thread_stack_ptr(void *th) {
-      if (!th)
-        return nullptr;
-      return ((thread *)th)->stack._ptr;
-    }
-    [[gnu::used]]
-    void *gdb_get_current_thread() {
-      return CURRENT;
-    }
-    [[gnu::used]]
-    void *gdb_get_next_thread(void *c) {
-      if (!c)
-        return nullptr;
-      return ((thread *)c)->next();
-    }
-    [[gnu::used]]
-    void *gdb_get_vcpu(void *th) {
-      if (!th)
-        return nullptr;
-      return (void *)((thread *)th)->vcpu;
-    }
-    [[gnu::used]]
-    size_t gdb_get_sleepq_size(void *vcpu) {
-      if (!vcpu)
-        return 0;
-      return ((vcpu_t *)vcpu)->sleepq.q.size();
-    }
-    [[gnu::used]]
-    void *gdb_get_sleepq_item(void *vcpu, size_t idx) {
-      if (!vcpu)
-        return nullptr;
-      if (((vcpu_t *)vcpu)->sleepq.q.size() <= idx)
-        return nullptr;
-      return ((vcpu_t *)vcpu)->sleepq.q[idx];
-    }
-    }
-}
+}  // namespace photon
+
+// =========================================================================
+// GDB Offset Export - Global Symbols
+// These symbols are directly readable by GDB, no separate tool needed.
+// GDB Python script reads: gdb.parse_and_eval("gdb_offsets")
+// =========================================================================
+
+extern "C" const struct {
+    // Version number for compatibility checking
+    // Increment when adding/removing/modifying/reordering offset fields
+    uint32_t version = 1;
+    uint32_t _reserved = 0;  // Padding for alignment
+    
+    // Thread structure
+    size_t thread_size = sizeof(photon::thread);
+    size_t thread_offset_prev = 0;
+    size_t thread_offset_next = sizeof(void*);
+    size_t thread_offset_vcpu = offsetof(photon::thread, vcpu);
+    size_t thread_offset_stack_ptr = offsetof(photon::thread, stack);
+    size_t thread_offset_idx = offsetof(photon::thread, idx);
+    size_t thread_offset_error_number = offsetof(photon::thread, error_number);
+    size_t thread_offset_waitq = offsetof(photon::thread, waitq);
+    size_t thread_offset_flags = offsetof(photon::thread, flags);
+    size_t thread_offset_state = offsetof(photon::thread, state);
+    size_t thread_offset_ts_wakeup = offsetof(photon::thread, ts_wakeup);
+    size_t thread_offset_tls = offsetof(photon::thread, tls);
+    size_t thread_offset_buf = offsetof(photon::thread, buf);
+    size_t thread_offset_stack_size = offsetof(photon::thread, stack_size);
+    
+    // vCPU structure
+    size_t vcpu_size = sizeof(photon::vcpu_t);
+    size_t vcpu_offset_sleepq = offsetof(photon::vcpu_t, sleepq);
+    size_t vcpu_offset_nthreads = offsetof(photon::vcpu_t, nthreads);
+    size_t vcpu_offset_idle_worker = offsetof(photon::vcpu_t, idle_worker);
+    size_t vcpu_offset_standbyq = offsetof(photon::vcpu_t, standbyq);
+    size_t vcpu_offset_list_node_prev = offsetof(photon::vcpu_t, __prev_ptr);
+    size_t vcpu_offset_list_node_next = offsetof(photon::vcpu_t, __next_ptr);
+} gdb_offsets;

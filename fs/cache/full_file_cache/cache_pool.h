@@ -35,7 +35,8 @@ namespace fs {
 class FileCachePool : public photon::fs::ICachePool {
 public:
     FileCachePool(photon::fs::IFileSystem *mediaFs, uint64_t capacityInGB, uint64_t periodInUs,
-                  uint64_t diskAvailInBytes, uint64_t refillUnit);
+                  uint64_t diskAvailInBytes, uint64_t refillUnit, 
+                  uint64_t storeCacheTTLUsecs = 10'000'000);
     ~FileCachePool();
 
     static const uint64_t kDiskBlockSize = 512; // stat(2)
@@ -43,9 +44,6 @@ public:
     static const uint32_t kWaterMarkRatio = 90;
 
     void Init();
-
-    //  pathname must begin with '/'
-    photon::fs::ICacheStore *do_open(std::string_view pathname, int flags, mode_t mode) override;
 
     int set_quota(std::string_view pathname, size_t quota) override;
     int stat(photon::fs::CacheStat *stat,
@@ -63,7 +61,6 @@ public:
         uint32_t lruIter;
         int openCount;
         uint64_t size;
-        photon::rwlock rw_lock_;
         bool truncate_done;
     };
 
@@ -80,6 +77,8 @@ public:
     uint64_t updateSpace(FileNameMap::iterator iter, uint64_t size);
 
 protected:
+    //  pathname must begin with '/'
+    photon::fs::ICacheStore *do_open(std::string_view pathname, int flags, mode_t mode) override;
     photon::fs::IFile *openMedia(std::string_view name, int flags, int mode);
 
     static uint64_t timerHandler(void *data);
